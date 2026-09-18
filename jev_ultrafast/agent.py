@@ -10,12 +10,14 @@ from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, uploads=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        # Files queued by the caller for UPLOAD actions. Model output never becomes a path.
+        self.uploads = list(uploads or [])
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -74,7 +76,9 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
-            state["decision"] = choose(state["page"], state["goal"], state["history"])
+            state["decision"] = choose(
+                state["page"], state["goal"], state["history"], allow_upload=bool(self.uploads)
+            )
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -114,7 +118,13 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            file_path = None
+            if action["kind"] == "upload":
+                if not self.uploads:
+                    state["status"] = "blocked"
+                    raise ValueError("UPLOAD was chosen but no files were queued for this run.")
+                file_path = self.uploads.pop(0)
+            state["browser"].act(action, page, text=text, file=file_path)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -128,6 +138,7 @@ class Agent:
                     "confidence": decision["confidence"],
                     "latency_ms": decision["latency_ms"],
                     "text": text,
+                    "file": file_path,
                     "text_helper": helper["model"] if helper else None,
                     "text_latency_ms": helper["latency_ms"] if helper else 0,
                     "operation": decision["operation"],

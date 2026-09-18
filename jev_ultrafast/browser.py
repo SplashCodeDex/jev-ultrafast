@@ -90,7 +90,7 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        if action is not None and action["kind"] in {"click", "select", "upload"}:
             node = action["node"]
             if type(node) is not int:
                 return False
@@ -101,7 +101,7 @@ class Browser:
             return current == [page["page_key"], page["guards"].get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
 
-    def act(self, action, page, text=None):
+    def act(self, action, page, text=None, file=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
@@ -110,7 +110,9 @@ class Browser:
             # Re-assert the foreground before dispatching input; focus can move between
             # steps, and a background tab silently swallows clicks and keystrokes.
             self.activate()
-        result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
+        result = browser_operation(
+            {"operation": "act", "session": self.session, "action": action, "text": text, "file": file}
+        )
         self.after_input = action if action["kind"] != "wait" else None
         return result
 
@@ -162,11 +164,39 @@ def browser_operation(request):
             raise StalePage("Document changed during evaluation")
         return result.get("result", {}).get("value")
 
+    def evaluate_object(expression):
+        """Evaluate to a remote object handle, for CDP calls that need one."""
+        result = call("Runtime.evaluate", expression=expression, returnByValue=False)
+        if result.get("exceptionDetails"):
+            raise StalePage("Document changed during evaluation")
+        return result.get("result", {}).get("objectId")
+
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
             call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+        elif kind == "upload":
+            # The path is supplied by the caller, never by the model. We resolve the node
+            # from the observed element table, re-check that it is still a usable file
+            # input, and only then hand the file to the browser.
+            path = request.get("file")
+            if not path:
+                raise RuntimeError("UPLOAD needs a file path from the caller; none was supplied.")
+            if type(action["node"]) is not int:
+                raise ValueError("Invalid observed node")
+            object_id = evaluate_object(
+                """(action => {
+              const e=window.__jevFast?.nodes.get(action.node);
+              if (!e?.isConnected || e.tagName!=='INPUT' || e.type!=='file' ||
+                  e.matches(':disabled') || e.closest('[inert]') ||
+                  !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
+              return e;
+            })(""" + json.dumps(action) + ")"
+            )
+            if not object_id:
+                raise StalePage("File input changed or is unavailable. Observe again.")
+            call("DOM.setFileInputFiles", files=[path], objectId=object_id)
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
