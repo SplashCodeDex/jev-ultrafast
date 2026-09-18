@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,9 @@ class Browser:
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        # Focus emulation keeps the page rendering, but Chrome still drops synthetic input
+        # in a background tab, so the tab has to be brought forward before any action.
+        self.activate()
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -102,9 +106,35 @@ class Browser:
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
             time.sleep(0.1)
+        else:
+            # Re-assert the foreground before dispatching input; focus can move between
+            # steps, and a background tab silently swallows clicks and keystrokes.
+            self.activate()
         result = browser_operation({"operation": "act", "session": self.session, "action": action, "text": text})
         self.after_input = action if action["kind"] != "wait" else None
         return result
+
+    def activate(self):
+        """Bring this tab to the front so Chrome accepts synthetic input.
+
+        Upstream creates the tab with ``background=True`` and never activates it.
+        Verified on Windows Chrome 152: with a background tab, ``mousePressed`` /
+        ``mouseReleased`` / ``Input.insertText`` are accepted by CDP and then silently
+        dropped, so the page never changes and every click looks like a stale target.
+        Set ``JEV_ACTIVATE_TAB=0`` to restore the old background behaviour.
+        """
+        if os.environ.get("JEV_ACTIVATE_TAB", "1") == "0":
+            return
+        if not self.target:
+            return
+        try:
+            cdp("Target.activateTarget", targetId=self.target)
+        except Exception:
+            pass
+        try:
+            self.call("Page.bringToFront")
+        except Exception:
+            pass
 
     def close(self):
         if self.target:
